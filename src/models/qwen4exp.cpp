@@ -452,7 +452,19 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             nullptr, nullptr, -1);
 
     cb(cur, "result_norm", -1);
-    res->t_embd = cur;
+
+    if (cparams.embeddings) {
+        // the embeddings readback reads n_embd_out (the wide stream) per token, but the
+        // collapsed mixer output is only n_embd wide -- a 4x overread at the first token.
+        // Export the wide residual instead, the same tensor the MTP head consumes. cont()
+        // forces a real allocation so the scheduler assigns it a backend for the readback.
+        ggml_tensor * wide = ggml_cont(ctx0,
+                ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]));
+        cb(wide, "result_wide", -1);
+        res->t_embd = wide;
+    } else {
+        res->t_embd = cur;
+    }
 
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);

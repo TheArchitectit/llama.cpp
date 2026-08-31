@@ -2194,6 +2194,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     this->n_outputs = 0;
 
+    if (n_outputs_max > cparams.n_outputs_max) {
+        LLAMA_LOG_ERROR("%s: n_outputs_max = %d > cparams.n_outputs_max = %u (n_seq_max = %u)\n",
+                __func__, (int) n_outputs_max, cparams.n_outputs_max, n_seq_max());
+    }
     GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
 
     return n_outputs_max;

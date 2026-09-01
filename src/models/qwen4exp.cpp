@@ -261,6 +261,21 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     return std::make_unique<graph>(*this, params);
 }
 
+// Unweighted mean over the hc streams -> [n_embd, T]. Mirrors dsv4_hc_mean in
+// deepseek4.cpp: the DFlash2 extract path (common/speculative.cpp) and the
+// layer-inp output buffer (llama-context.cpp output_reserve) both assume rows
+// of n_embd, so exporting the raw wide [n_embd, hc, T] residual would overflow
+// the reserved buffer. The reference GLM DFlash2 was trained on this mean.
+static ggml_tensor * hc_mean_rows(ggml_context * ctx, ggml_tensor * x) {
+    const int64_t hc = x->ne[1];
+
+    ggml_tensor * acc = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], 0);
+    for (int64_t s = 1; s < hc; ++s) {
+        acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
+    }
+    return ggml_scale(ctx, acc, 1.0f/hc);
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
@@ -375,7 +390,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cb(res_hc, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = res_hc;
+        // export the block input as the hc-mean row stream when extraction is
+        // enabled; unconditional recording (the old code) pointed the narrow
+        // n_embd-sized extraction buffer at a wide [n_embd, hc] residual.
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = hc_mean_rows(ctx0, res_hc);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
 
         if (hparams.is_ple(il)) {
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);

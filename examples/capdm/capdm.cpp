@@ -14,7 +14,10 @@
 // (fp16 [T, W]).
 //
 // Env: CAPD_TARGET (total tokens), CAPD_SHARD (tokens per shard), CAPD_LAYER
-// (block index whose input to export; default n_layer-8).
+// (block index whose input to export; default n_layer-8), or CAPD_LAYERS
+// ("6,20,34,48,62" — multi-layer concat: per-token rows of each layer appended
+// in the given order into ONE .layer.npy of width L*n_embd, matching the
+// reference DFlash2 fc = concat[layer inputs]).
 #include "arg.h"
 #include "common.h"
 #include "log.h"
@@ -145,14 +148,30 @@ int main(int argc, char ** argv) {
     if (!model || !ctx) { LOG_ERR("%s: failed to load model\n", __func__); return 1; }
 
     const int n_layer = llama_model_n_layer(model);
-    uint32_t layer = n_layer - 8;
-    if (const char * e = std::getenv("CAPD_LAYER")) layer = strtoul(e, nullptr, 10);
-    if (layer >= (uint32_t) n_layer) { LOG_ERR("%s: CAPD_LAYER %u >= n_layer %d\n", __func__, layer, n_layer); return 1; }
+    std::vector<uint32_t> layers;
+    if (const char * e = std::getenv("CAPD_LAYERS")) {  // multi-layer concat wins over CAPD_LAYER
+        std::stringstream ss(e);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (tok.empty()) continue;
+            uint32_t l = strtoul(tok.c_str(), nullptr, 10);
+            if (l >= (uint32_t) n_layer) { LOG_ERR("%s: CAPD_LAYERS entry %u >= n_layer %d\n", __func__, l, n_layer); return 1; }
+            layers.push_back(l);
+        }
+    } else {
+        uint32_t layer = n_layer - 8;
+        if (const char * e = std::getenv("CAPD_LAYER")) layer = strtoul(e, nullptr, 10);
+        if (layer >= (uint32_t) n_layer) { LOG_ERR("%s: CAPD_LAYER %u >= n_layer %d\n", __func__, layer, n_layer); return 1; }
+        layers.push_back(layer);
+    }
+    if (layers.empty()) { LOG_ERR("%s: no layers requested\n", __func__); return 1; }
 
-    // request extraction of the chosen block's INPUT residual; the setter marks
+    // request extraction of the chosen block(s)' INPUT residual; the setter marks
     // the scheduler for re-reserve, so the buffers exist from the next decode on.
-    llama_set_embeddings_layer_inp(ctx, layer, true);
-    LOG_INF("%s: layer input extraction enabled for layer %u of %d\n", __func__, layer, n_layer);
+    for (uint32_t l : layers) {
+        llama_set_embeddings_layer_inp(ctx, l, true);
+    }
+    LOG_INF("%s: layer input extraction enabled for %zu layers of %d\n", __func__, layers.size(), n_layer);
 
     // read chunks and split
     std::vector<std::string> pieces;
@@ -200,18 +219,24 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s: decode failed\n", __func__);
             llama_batch_free(batch); pending.clear(); pending_tok = 0; return;
         }
-        const float * li = llama_get_embeddings_layer_inp(ctx, layer);
-        if (!li) {
-            LOG_ERR("%s: layer %u input stream unavailable (extraction not reserved?)\n", __func__, layer);
-            llama_batch_free(batch); return;
-        }
         // Rows are [n_embd] each after the qwen4exp hc_mean extraction patch
-        // (deepseek4.cpp convention); rows map 1:1 to batch token order.
+        // (deepseek4.cpp convention); rows map 1:1 to batch token order. In
+        // multi-layer mode each token's row is the concat of the requested
+        // layers, in CAPD_LAYERS order (matches reference fc-input geometry).
+        const size_t row_w = (size_t) n_embd * layers.size();
+        for (uint32_t l : layers) {
+            if (!llama_get_embeddings_layer_inp(ctx, l)) {
+                LOG_ERR("%s: layer %u input stream unavailable (extraction not reserved?)\n", __func__, l);
+                llama_batch_free(batch); return;
+            }
+        }
         for (size_t n = 0; n < (size_t) batch.n_tokens; ++n) {
             cur_toks.push_back(batch.token[n]);
-            const float * row = li + n * (size_t) n_embd;
-            for (int d = 0; d < n_embd; ++d) {
-                cur_embd.push_back((uint16_t) float_to_half_bits(row[d]));
+            for (uint32_t l : layers) {
+                const float * row = llama_get_embeddings_layer_inp(ctx, l) + n * (size_t) n_embd;
+                for (int d = 0; d < n_embd; ++d) {
+                    cur_embd.push_back((uint16_t) float_to_half_bits(row[d]));
+                }
             }
         }
         total_tokens += pending_tok;
@@ -219,7 +244,7 @@ int main(int argc, char ** argv) {
         pending.clear(); pending_tok = 0;
         LOG_INF("%s: progress %zu tokens\n", __func__, total_tokens);
         if (cur_toks.size() >= shard_tokens) {
-            save_shard(out_dir, shard_idx++, cur_toks, cur_embd, n_embd);
+            save_shard(out_dir, shard_idx++, cur_toks, cur_embd, (int) row_w);
             cur_toks.clear(); cur_embd.clear();
         }
     };

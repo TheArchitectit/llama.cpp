@@ -260,7 +260,11 @@ int main(int argc, char ** argv) {
         pending_tok += pending.back().size();
     }
     flush_window();
-    if (!cur_toks.empty()) save_shard(out_dir, shard_idx++, cur_toks, cur_embd, n_embd);
+    // final flush must use the SAME row width as the per-shard flush (n_embd
+    // alone was a single-layer-era leftover: multi-layer runs wrote a 5x-short
+    // header over the full concat data)
+    if (!cur_toks.empty()) save_shard(out_dir, shard_idx++, cur_toks, cur_embd,
+                                      (int) (n_embd * layers.size()));
     LOG_INF("%s: done, %zu tokens in %d shards\n", __func__, total_tokens, shard_idx);
     return 0;
 }
